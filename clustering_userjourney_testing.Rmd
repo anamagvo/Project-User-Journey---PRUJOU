@@ -1,0 +1,371 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+Für die Grundsätze der Idee gibt einen Talk zum Thema 'was ist DTW' (TODO: den auf Github hochladen)
+---
+rm(list = ls())
+
+```{r,include=F,warning=F,message=F}
+library(dplyr)
+library(GGally)
+library(network)
+library(sna)
+library(ggplot2)
+library(igraph)
+library(dtw)
+library(data.table)
+```
+
+    -- get sessions with list of visited content_ids
+    SELECT
+      channel,
+      session_id,
+      sp4_ck_user_id,
+      min (date_time) as session_start,
+      max (date_time) as session_end,
+      count(*) as num_requests,
+      concat_ws('|', collect_list(area)) as content_id
+    FROM (
+    SELECT
+        date_time,
+        session_id,
+	      case split(content_id,'[\.]')[1]  -- extract channel data
+		    when "web"  then "web"
+		    when "mweb" then "mweb"
+		    when "mew"  then "mew"
+		    when "app"  then "app"
+		    when "amp"  then "amp"
+		            else "other"
+	      end                                                       as channel,
+	      substr(content_id, 8) as area,
+	      sp4_ck_user_id
+	      FROM webtrekk.request 
+	      WHERE dt = "2017-07-01" AND
+	          sp4_ck_user_id is not null AND
+	          split(content_id,'[\.]')[1] in ('web')
+	      ORDER BY date_time
+        ) x
+        GROUP BY channel, session_id, sp4_ck_user_id 
+        HAVING count(*) > 5 AND count(*) < 15
+
+```{r}
+#unter komischem Namen auf meiner hd gespeichert
+myfile ='sessiondata_2017-07-01.csv'
+sessiondata<- fread(myfile,header=TRUE)
+```
+
+Daten für Distanzmatrix: 
+
+    -- weniger daten (von einem Monat oder wahlweise von einem Tag) Ausstiege im Juni
+    SELECT count(*)															as count, 
+    first_content,
+    second_content
+    FROM(
+    SELECT
+    --session_id,
+    lead(content_id,1) OVER (PARTITION BY session_id ORDER BY date_time) 	as second_content,
+    content_id 																as first_content
+    --sp4_ck_user_id															as user_id
+    FROM webtrekk.request
+    WHERE split(content_id,'[\.]')[1] in ('web','mew','amp','mweb')
+    	and dt LIKE '2017-06-%%') as x
+    GROUP BY first_content, second_content ORDER BY count desc
+
+
+
+```{r}
+#Daten siehe SQL Statement oben
+myfile ='C:/AusDemVollen/processing/proj_Nutzerverhalten/ausstiege_juni_2017_mit_abs_count.csv'
+ausstiege <- fread(myfile,header=TRUE)
+```
+
+Vorbereiten der Übergangswahrscheinlichkeiten
+```{r,warning=F,message=F}
+ausstiege_clean<-ausstiege[,count:=as.numeric(gsub("\\.","",count))]
+ausstiege_clean[,second_content:=ifelse(second_content=='','Ausstieg',second_content)]
+ausstiege_clean[,first_content_total:= sum(count),by=first_content]
+ausstiege_clean[,distance:=as.double(format(count/first_content_total,scientific = F))]
+```
+
+
+```{r,include=F}
+alldata<-ausstiege_clean[,.(first_content,second_content,percentage)]
+#colnames(alldata)[colnames(alldata)=="percentage"] <- "distance"
+```
+
+Plan: nutze dtw Funktion mit den Distanzen aus der Tabelle mit den Übergangswahrscheinlichkeiten in der Tabelle 'alldata'
+```{r,include=F}
+#Testbeispiel für die Methode
+x<-c(1,2,5,2)
+y<-c(2,1,2,2)
+
+myfun<-function(x,y){
+  ifelse(x==y,2,1)
+}
+
+#sandbox example to test if dist is possible with other than time series arguments. Answer: no.
+#xx<-data.frame(2,2)
+#xx$value<-7
+#myfun2<-function(x,y){
+ # z=x$value
+#}
+#dist(x,y,method = myfun2)
+```
+
+Fazit: lokale Distanzmatrix aufbauen und dann mit der Methode 'dtw' weiter machen
+```{r}
+#Testbeispiel
+d<-dtw(dist(x,y[1:3]))
+dtwPlotAlignment(d, xlab="Query index", ylab="Template index")
+```
+
+
+Beispiel für zwei Zeitreihen aus der Gesamtmenge
+```{r}
+x<-sessiondata[1,content_id]
+#y<-sessiondata[550,content_id]
+y<-x
+cx<-sessiondata[1]$channel
+#cy<-sessiondata[550]$channel
+cy<-cx
+```
+
+Helper functions für das obige Beispiel
+```{r}
+
+dx<-unlist(strsplit(x, "\\|", fixed = FALSE, perl = FALSE, useBytes = FALSE))
+dy<-unlist(strsplit(y, "\\|", fixed = FALSE, perl = FALSE, useBytes = FALSE))
+  
+computeDistances<-function(x,y,cx,cy,distancetable){
+  m<-matrix(0,length(y),length(x))
+  for(i in 1:length(x)){
+    x_loc<-paste('de',cx,x[i],sep=".")
+    for(j in 1:length(y)){
+      y_loc<-paste('de',cy,y[j],sep=".")
+      #Idee: Distanzen symmetrisch machen, indem man das reziproke Gegenstück addiert
+      d<-distancetable[first_content==x_loc&second_content==y_loc]
+      d_plus<-distancetable[second_content==x_loc&first_content==y_loc]
+      m[j,i]<-(1-(d[1,]$distance+d_plus[1,]$distance))}
+  }
+  return(as.matrix(m))
+}
+
+#Das gehört noch zum Beispiel von oben
+dummy<-computeDistances(dx,dy,cx,cy,alldata)
+```
+
+
+```{r}
+d_alignment<-dtw(dummy,keep=TRUE,step=symmetric2)
+dtwPlotAlignment(d_alignment, xlab="Query index", ylab="Template index")
+d_alignment$distance
+```
+NB: Für den manuellen Vergleich mit sehr ähnlichen (Index 1 zu sich selbst; Distanz 2.52) oder sehr verschiedenen (Index 1 zu 550, Distanz 14...) Paaren von Zeitreihen 
+```{r}
+print(dx)
+```
+
+
+```{r}
+print(dy)
+```
+
+Test mit for-loops (Problem: im Prinzip sitzen hier 4 Schleifen ineinander, daher skaliert das noch nicht auf die Originalgrößen)
+```{r}
+x<-sessiondata[1:3,content_id]
+cx<-sessiondata[1:3]$channel
+  
+contentlist_x<-lapply(x,function(y) unlist(strsplit(y, "\\|", fixed = FALSE, perl = FALSE, useBytes = FALSE)))
+#x_loc<-mapply(pastefun,cx,contentlist_x)
+
+n=nrow(sessiondata[1:3,])
+alldistances<-matrix(NaN,n,n)
+tictoc<-system.time(
+for(k in 1:n){
+  x<-sessiondata[k,content_id]
+  cx<-sessiondata[k]$cha
+  dx<-unlist(strsplit(x, "\\|", fixed = FALSE, perl = FALSE, useBytes = FALSE))
+  message(sprintf("index1 : %s\n", k))
+  for(l in k:n){
+  y<-sessiondata[l,content_id]
+  cy<-sessiondata[l]$channel
+  #message(sprintf("index2 : %s\n", l))
+  dy<-unlist(strsplit(y, "\\|", fixed = FALSE, perl = FALSE, useBytes = FALSE))
+  distance<-computeDistances(dx,dy,cx,cy,alldata)
+  d_alignment<-try(dtw(distance,step=symmetric2),silent=T)
+    #tryCatch(dtw(distance,keep=TRUE,step=symmetric2),silent=T);warning = function(w) {print(paste("no warping path possible under given conditions for pair",c(k,l)));data.frame(distance=-1)}
+  alldistances[k,l]<-ifelse(!is.atomic(d_alignment),d_alignment$distance,Inf)
+  }
+})
+```
+Helper functions für die beschleunigte Variante
+```{r}
+pastefun<-function(channel,data){out_x<-paste('de',channel,data,sep=".")}
+
+
+computeDistances_local<-function(x,y,distancetable){
+  m<-matrix(NaN,length(x),length(y))
+  for(i in 1:length(x)){
+    x_loc<-x[i]
+    for(j in 1:length(y)){
+      y_loc<-y[j]
+      d<-distancetable[first_content==x_loc&second_content==y_loc]
+      d_plus<-distancetable[second_content==x_loc&first_content==y_loc]
+      m[i,j]<-(1-(d[1,]$distance+d_plus[1,]$distance))}
+  }
+  return(as.matrix(m))
+}
+
+```
+
+
+Hier beginnt der Versuch, es effizienter zu gestalten :) Der massiv scheiterte. Zusammenfassung siehe unten
+```{r}
+x<-sessiondata[,content_id]
+cx<-sessiondata[]$channel
+contentlist_x<-lapply(x,function(y) unlist(strsplit(y, "\\|", fixed = FALSE, perl = FALSE, useBytes = FALSE)))
+x_loc<-mapply(pastefun,cx,contentlist_x)
+
+n=length(x_loc)
+alldistances<-matrix(NaN,n,n)
+tictoc1<-system.time(
+for(k in 1:n){
+  x_l<-x_loc[k]$web
+  for(l in k:n){
+  y<-x_loc[l]$web
+  message(sprintf("processing index1: %s, index2 : %s\n",k,l))
+  distance<-computeDistances_local(x_l,y,alldata)
+  d_alignment<-try(dtw(distance,step=symmetric2),silent=T) #,distance.only=T (angeblich wird es so schneller...)
+  alldistances[k,l]<-ifelse(!is.atomic(d_alignment),d_alignment$distance,Inf)
+  if(k%%100==0&l==n){saveRDS(alldistances,file="C:/AusDemVollen/processing/proj_Nutzerverhalten/userjourney/dtwdistances.Rda")}
+  }
+  if(k==n&l==n){saveRDS(alldistances,file="C:/AusDemVollen/processing/proj_Nutzerverhalten/userjourney/dtwdistances.Rda")}
+  #or k==n&l==n)
+}
+)
+
+tictoc1
+
+#bar <- readRDS(file="C:/AusDemVollen/processing/proj_Nutzerverhalten/userjourney/dtwdistances.Rda")
+#es existieren bis dato die ersten 100 Indizes
+```
+
+Momentan sehen unsere Optionen wie folgt aus:
+
+1. DTW Rechnung in die Cloud auslagern (mit Team Neo besprechen)
+2. DTW Rechnung durch Portieren nach C++ o. ä. beschleunigen. Package Rcpp war leider noch nicht richtig installierbar.
+3.Extern weitersuchen: Forum, z. B. auf Stack exchange eine Beschreibung des Problems posten.
+
+
+Tipp zum Parallelisieren
+```{r}
+library(foreach)
+library(doParallel)
+
+#setup parallel backend to use many processors
+cores=detectCores()
+cl <- makeCluster(cores[1]-1) #not to overload your computer
+registerDoParallel(cl)
+
+tictoc_par<-system.time(
+#finalMatrix <- foreach(k=1:n, .combine=cbind) %dopar% {
+for(k in 1:n){
+  x_l<-x_loc[k]$web
+    innerMatrix <- foreach(l=k:n, .combine=rbind) %dopar% {
+    y<-x_loc[l]$web
+    distance<-computeDistances_local(x_l,y,alldata)
+    distance
+    }
+  tempMatrix<-innerMatrix
+}
+)
+#stop cluster
+stopCluster(cl)
+#Functioniert leider auch so nicht: innere Funktion verursacht Probleme: 'Error in { : task 1 failed - "Objekt 'first_content' nicht gefunden"'
+```
+
+
+Sobald das Problem der DTW Rechnung gelöst ist, kann auch eine größere Menge an Daten geclustert werden.
+Hier folgt zunächst ein Proof of Concept
+```{r}
+library(cluster)
+
+#bar <- readRDS(file="C:/AusDemVollen/processing/proj_Nutzerverhalten/userjourney/dtwdistances.Rda")
+exampledata<-bar[1:100,1:100]
+d1 = as.dist(t(exampledata))
+d1[is.infinite(d1)] <- 3000 
+clustering<-hclust(d1)
+
+# Clustering Methode, die sich zum Behalten der Medoids eignet.
+clustering2<-pam(d1, 5)
+#clustering1<-agnes(d1,diss=TRUE)
+groups <- cutree(clustering, k=5) # cut tree into 3 clusters
+
+plot(clustering)
+rect.hclust(clustering, k=5, border="red")
+
+reddata<-x[1:100]
+
+
+group1<-reddata[groups==1]
+group2<-reddata[groups==2]
+group3<-reddata[groups==3]
+group4<-reddata[groups==4]
+group5<-reddata[groups==5]
+
+#Gruppen aufgrund des medoid clusterings...
+group_pam1<-reddata[clustering2$clustering == 1]
+group_pam2<-reddata[clustering2$clustering==2]
+group_pam3<-reddata[clustering2$clustering == 3]
+group_pam4<-reddata[clustering2$clustering==4]
+group_pam5<-reddata[clustering2$clustering==5]
+
+medoids<-reddata[clustering2$medoids]
+distmedoids<-exampledata[clustering2$medoids,clustering2$medoids]
+
+#max(distmedoids[!is.na(distmedoids)])
+#max(exampledata[!is.na(exampledata)&!is.infinite(exampledata)])
+```
+
+
+
+Word Cloud Visualisierung
+
+```{r}
+#install.packages('wordcloud',dependencies = T)
+#library(tm)
+#library(SnowballC)
+library(wordcloud)
+```
+
+
+
+```{r}
+
+vec<-unlist(x_loc[groups==1])
+tb<-table(vec)
+wordcloud(names(tb),as.numeric(tb),max.words=10, scale = c(2, 0.4))
+```
+
+```{r}
+
+vec2<-unlist(x_loc[groups==2])
+tb2<-table(vec2)
+wordcloud(names(tb2),as.numeric(tb2),max.words=10, scale = c(2, 0.4))
+```
+
+```{r}
+
+vec<-unlist(x_loc[clustering2$clustering==3])
+tb<-table(vec)
+wordcloud(names(tb),as.numeric(tb),max.words=10, scale = c(2, 0.4))
+```
+
+
+```{r}
+
+vec<-unlist(x_loc[clustering2$clustering==4])
+tb<-table(vec)
+wordcloud(names(tb),as.numeric(tb), scale = c(2, 0.4))
+```
